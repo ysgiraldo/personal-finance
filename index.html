@@ -36,7 +36,12 @@
                 <option value="gasto">Gasto</option>
                 <option value="inversion">Inversión</option>
             </select>
-            <input type="text" id="medio" placeholder="Medio" required>
+            <select id="medio" required>
+                <option value="Tarjeta de crédito">Tarjeta de crédito</option>
+                <option value="Cuenta de ahorro">Cuenta de ahorro</option>
+                <option value="Efectivo">Efectivo</option>
+                <option value="Puntos Colombia">Puntos Colombia</option>
+            </select>
             <input type="text" id="item" placeholder="Descripción" required>
             <input type="number" id="valor" placeholder="Valor" required min="0">
             <button type="submit">Agregar</button>
@@ -97,7 +102,9 @@
                 datos.forEach(r => {
                     const tr = document.createElement('tr');
                     tr.className = r.tipo;
-                    tr.innerHTML = `<td>${r.fecha}</td><td>${r.medio}</td><td>${r.item}</td><td>$ ${formatearMoneda(r.valor)}</td>`;
+                    // Asegura que el valor sea número antes de formatear
+                    const valorFormateado = formatearMoneda(Number(r.valor));
+                    tr.innerHTML = `<td>${r.fecha}</td><td>${r.medio}</td><td>${r.item}</td><td>$ ${valorFormateado}</td>`;
                     tbody.appendChild(tr);
                 });
             }
