@@ -1,0 +1,5 @@
+flask==3.0.3
+python-dotenv==1.0.1
+twilio==9.3.7
+anthropic==0.34.2
+apscheduler==3.10.4
