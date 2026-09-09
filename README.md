@@ -1,4 +1,4 @@
-# Bot de Finanzas Personales (Python + Flask + Twilio + Claude)
+# Finanzas Personales
 
 Misma idea que la versión en Node.js: recibes SMS con tus movimientos en
 lenguaje natural ("gaste 25000 en almuerzo"), Claude los interpreta, se
@@ -10,7 +10,7 @@ metas.
 ```bash
 cd finanzas-bot-py
 python3 -m venv venv
-source venv/bin/activate      # en Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -57,7 +57,7 @@ curl -X POST http://localhost:3000/test -H "Content-Type: application/json" \
   -d '{"texto": "resumen mensual"}'
 ```
 
-## 4. Conectar con Twilio de verdad (SMS reales)
+## 4. Conectar con Twilio para mensajes de texto
 
 1. Compra un número con SMS en la consola de Twilio.
 2. Para probar en local, instala [ngrok](https://ngrok.com/) y corre:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from anthropic import Anthropic
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -8,7 +9,7 @@ client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 # y no necesita el modelo mas potente/caro.
 MODELO = "claude-haiku-4-5-20251001"
 
-SYSTEM_PROMPT = """Eres un asistente que extrae datos financieros de mensajes de texto en español coloquial (Colombia).
+SYSTEM_PROMPT = """Eres un asistente que extrae datos financieros de mensajes de texto en español (Colombia).
 
 Dado un mensaje, responde SOLO con un JSON valido (sin markdown, sin backticks, sin texto adicional) con esta forma exacta:
 
@@ -40,8 +41,13 @@ def interpretar_mensaje(texto):
     if bloque_texto is None:
         raise ValueError("El modelo no devolvio texto")
 
+    # (```json ... ```) a pesar de las instrucciones.
+    texto_limpio = bloque_texto.strip()
+    texto_limpio = re.sub(r"^```(?:json)?\s*", "", texto_limpio)
+    texto_limpio = re.sub(r"\s*```$", "", texto_limpio)
+
     try:
-        datos = json.loads(bloque_texto.strip())
+        datos = json.loads(texto_limpio.strip())
     except json.JSONDecodeError as err:
         raise ValueError(f"No se pudo parsear la respuesta del modelo: {bloque_texto}") from err
 
