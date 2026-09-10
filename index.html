@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Finanzas Personales</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f7f7f7; }
+        .container { max-width: 600px; margin: 0 auto; padding: 1rem; background: #fff; box-shadow: 0 2px 8px #0001; border-radius: 8px; margin-top: 2rem; }
+        h1 { text-align: center; color: #333; }
+        form { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+        form input, form select { flex: 1 1 45%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
+        form button { flex: 1 1 100%; padding: 0.7rem; background: #007bff; color: #fff; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+        form button:hover { background: #0056b3; }
+        .section { margin-bottom: 2rem; }
+        .section h2 { margin-bottom: 0.5rem; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 0.5rem; }
+        th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; }
+        th { background: #f0f0f0; }
+        .ingreso { background: #fffbe6; }
+        .gasto { background: #ffeaea; }
+        .inversion { background: #eaffea; }
+        @media (max-width: 600px) {
+            .container { margin-top: 0.5rem; padding: 0.5rem; }
+            form input, form select, form button { font-size: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Finanzas Personales</h1>
+        <form id="registroForm">
+            <input type="date" id="fecha" required>
+            <select id="tipo" required>
+                <option value="ingreso">Ingreso</option>
+                <option value="gasto">Gasto</option>
+                <option value="inversion">Inversión</option>
+            </select>
+            <select id="medio" required>
+                <option value="Tarjeta de crédito">Tarjeta de crédito</option>
+                <option value="Cuenta de ahorro">Cuenta de ahorro</option>
+                <option value="Efectivo">Efectivo</option>
+                <option value="Puntos Colombia">Puntos Colombia</option>
+            </select>
+            <input type="text" id="item" placeholder="Descripción" required>
+            <input type="number" id="valor" placeholder="Valor" required min="0">
+            <button type="submit">Agregar</button>
+        </form>
+        <div class="section">
+            <h2>Ingresos</h2>
+            <table id="tablaIngresos">
+                <thead>
+                    <tr><th>Fecha</th><th>Medio</th><th>Descripción</th><th>Valor</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <strong>Total: $<span id="totalIngresos">0</span></strong>
+        </div>
+        <div class="section">
+            <h2>Gastos</h2>
+            <table id="tablaGastos">
+                <thead>
+                    <tr><th>Fecha</th><th>Medio</th><th>Descripción</th><th>Valor</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <strong>Total: $<span id="totalGastos">0</span></strong>
+        </div>
+        <div class="section">
+            <h2>Inversiones</h2>
+            <table id="tablaInversiones">
+                <thead>
+                    <tr><th>Fecha</th><th>Medio</th><th>Descripción</th><th>Valor</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <strong>Total: $<span id="totalInversiones">0</span></strong>
+        </div>
+    </div>
+    <script>
+        // Utilidades para LocalStorage
+        function obtenerRegistros() {
+            return JSON.parse(localStorage.getItem('finanzas') || '[]');
+        }
+        function guardarRegistros(registros) {
+            localStorage.setItem('finanzas', JSON.stringify(registros));
+        }
+
+        function formatearMoneda(valor) {
+            return valor.toLocaleString('es-CO');
+        }
+
+        function renderizarTablas() {
+            const registros = obtenerRegistros();
+            const ingresos = registros.filter(r => r.tipo === 'ingreso');
+            const gastos = registros.filter(r => r.tipo === 'gasto');
+            const inversiones = registros.filter(r => r.tipo === 'inversion');
+
+            function renderizar(tablaId, datos) {
+                const tbody = document.querySelector(`#${tablaId} tbody`);
+                tbody.innerHTML = '';
+                datos.forEach(r => {
+                    const tr = document.createElement('tr');
+                    tr.className = r.tipo;
+                    // Asegura que el valor sea número antes de formatear
+                    const valorFormateado = formatearMoneda(Number(r.valor));
+                    tr.innerHTML = `<td>${r.fecha}</td><td>${r.medio}</td><td>${r.item}</td><td>$ ${valorFormateado}</td>`;
+                    tbody.appendChild(tr);
+                });
+            }
+
+            renderizar('tablaIngresos', ingresos);
+            renderizar('tablaGastos', gastos);
+            renderizar('tablaInversiones', inversiones);
+
+            document.getElementById('totalIngresos').textContent = formatearMoneda(ingresos.reduce((a, r) => a + Number(r.valor), 0));
+            document.getElementById('totalGastos').textContent = formatearMoneda(gastos.reduce((a, r) => a + Number(r.valor), 0));
+            document.getElementById('totalInversiones').textContent = formatearMoneda(inversiones.reduce((a, r) => a + Number(r.valor), 0));
+        }
+
+        document.getElementById('registroForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const registro = {
+                fecha: document.getElementById('fecha').value,
+                tipo: document.getElementById('tipo').value,
+                medio: document.getElementById('medio').value,
+                item: document.getElementById('item').value,
+                valor: document.getElementById('valor').value
+            };
+            const registros = obtenerRegistros();
+            registros.push(registro);
+            guardarRegistros(registros);
+            renderizarTablas();
+            this.reset();
+        });
+
+        // Inicializar
+        renderizarTablas();
+    </script>
+</body>
+</html>
