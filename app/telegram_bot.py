@@ -26,6 +26,8 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     texto = update.message.text or ""
 
+    # Primera vez: si aun no configuraste tu chat_id, te lo mostramos para que
+    # lo copies en .env. Esto evita que cualquier persona use tu bot.
     if not MY_CHAT_ID:
         await update.message.reply_text(
             f"Tu chat_id es: {chat_id}\n\n"
@@ -74,9 +76,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))
 
     if MY_CHAT_ID:
+        # Resumen semanal: domingos a las 8:00 PM (hora Bogota). weekday 6 = domingo.
         app.job_queue.run_daily(
             _job_resumen_semanal, time=time(20, 0, tzinfo=TZ), days=(6,), name="resumen_semanal"
         )
+        # Alerta de presupuesto: todos los dias a las 9:00 AM (solo avisa si hay riesgo)
         app.job_queue.run_daily(
             _job_alerta_presupuesto, time=time(9, 0, tzinfo=TZ), name="alerta_presupuesto"
         )
