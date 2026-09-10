@@ -116,7 +116,6 @@ en Python a `node-cron`):
   modelo más potente.
 
 ## Próximos pasos sugeridos (no incluidos en este prototipo)
-
 - Fecha de inicio real para la meta de ahorro (para calcular si vas
   "adelantado o atrasado" con precisión, no solo el mes actual).
 - Editar/borrar un registro por error (ej. "borra el ultimo gasto").
