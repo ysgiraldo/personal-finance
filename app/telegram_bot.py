@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-MY_CHAT_ID = os.environ.get("MY_TELEGRAM_CHAT_ID")  # vacio la primera vez, ver instrucciones abajo
+MY_CHAT_ID = os.environ.get("MY_TELEGRAM_CHAT_ID")
 TZ = ZoneInfo("America/Bogota")
 
 
@@ -48,8 +48,6 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     texto = update.message.text or ""
 
-    # Primera vez: si aun no configuraste tu chat_id, te lo mostramos para que
-    # lo copies en .env. Esto evita que cualquier persona use tu bot.
     if not MY_CHAT_ID:
         await update.message.reply_text(
             f"Tu chat_id es: {chat_id}\n\n"

@@ -139,7 +139,7 @@ def definir_presupuesto(categoria, limite_mensual):
     conn.close()
 
 
-# --- Presupuesto general (no por categoria, sino un tope total del mes) ---
+# --- Presupuesto general ---
 
 def definir_presupuesto_general(limite_mensual):
     conn = conectar()
@@ -161,7 +161,7 @@ def obtener_presupuesto_general():
     return fila
 
 
-# --- Editar / borrar transacciones (para corregir equivocaciones) ---
+# --- Editar / borrar transacciones ---
 
 def obtener_transaccion(id_transaccion):
     conn = conectar()
@@ -212,7 +212,7 @@ def editar_categoria_transaccion(id_transaccion, nueva_categoria):
     return filas_afectadas > 0
 
 
-# --- Gastos fijos (recurrentes: arriendo, suscripciones, etc.) ---
+# --- Gastos fijos ---
 
 def definir_gasto_fijo(nombre, monto_mensual, categoria=None):
     conn = conectar()
@@ -293,7 +293,7 @@ def registrar_gastos_fijos_pendientes(fecha_ref=None):
     return registrados_ahora
 
 
-# --- Fondos de ahorro (metas de ahorro con nombre propio: carro, estudio, etc.) ---
+# --- Fondos de ahorro ---
 
 def definir_fondo(nombre, monto_objetivo=None, fecha_objetivo=None):
     conn = conectar()

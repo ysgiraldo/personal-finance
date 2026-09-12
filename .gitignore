@@ -6,3 +6,4 @@ venv
 test-api
 
 __pycache__/
+logs/
