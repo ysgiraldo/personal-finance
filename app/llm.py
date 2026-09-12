@@ -5,12 +5,11 @@ from anthropic import Anthropic
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-# Usamos Haiku porque la tarea (clasificar monto/categoria/tipo) es simple, no se necesita modelo potente
+# Usamos Haiku porque la tarea (clasificar monto/categoria/tipo) es simple
+# y no necesita el modelo mas potente/caro.
 MODELO = "claude-haiku-4-5-20251001"
 
-SYSTEM_PROMPT = """
-
-Eres un asistente que extrae datos financieros de mensajes de texto en español coloquial (Colombia).
+SYSTEM_PROMPT = """Eres un asistente que extrae datos financieros de mensajes de texto en español coloquial (Colombia).
 
 Dado un mensaje, responde SOLO con un JSON valido (sin markdown, sin backticks, sin texto adicional) con esta forma exacta:
 
@@ -54,9 +53,7 @@ Otras reglas:
   Si no dice nada sobre el medio de pago, usa null. Los unicos valores
   validos son: "efectivo", "tarjeta_credito", "tarjeta_debito",
   "transferencia", o null. No inventes un medio de pago si no se menciono.
-- Si el mensaje no tiene sentido financiero o no trae un monto, responde con {"error": "no_entendido"}.
-
-"""
+- Si el mensaje no tiene sentido financiero o no trae un monto, responde con {"error": "no_entendido"}."""
 
 
 def interpretar_mensaje(texto):
