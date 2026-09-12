@@ -182,7 +182,7 @@ def resumen_mensual_con_proyeccion():
     return "Proyeccion de cierre de mes:\n" + "\n".join(lineas)
 
 
-# --- Presupuesto general ---
+# --- Presupuesto general (tope total del mes, sin importar la categoria) ---
 
 def progreso_general():
     meta = db.obtener_presupuesto_general()
@@ -246,7 +246,7 @@ def resumen_gastos_fijos():
     return texto
 
 
-# --- Balance por medio de pago ---
+# --- Balance por medio de pago (efectivo, tarjeta credito, debito, transferencia) ---
 
 NOMBRES_MEDIO_PAGO = {
     "efectivo": "Efectivo",

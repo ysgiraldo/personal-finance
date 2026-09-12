@@ -1,6 +1,5 @@
 import os
 import logging
-import threading
 from datetime import time
 from zoneinfo import ZoneInfo
 
@@ -8,7 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from flask import Flask
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
@@ -18,30 +16,10 @@ from .core import procesar_mensaje
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-# Silenciamos los logs de cada ping de salud, para no ensuciar la consola
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-MY_CHAT_ID = os.environ.get("MY_TELEGRAM_CHAT_ID")
+MY_CHAT_ID = os.environ.get("MY_TELEGRAM_CHAT_ID") 
 TZ = ZoneInfo("America/Bogota")
-
-
-# --- Mini-servidor ---
-# Render (y similares) solo ofrecen nivel gratuito a servicios que escuchan
-# un puerto HTTP ("Web Service"), no a los Background Workers, abrimos un puerto
-# minimo para calificar como Web Service y evitar el costo del Worker.
-salud_app = Flask(__name__)
-
-
-@salud_app.route("/")
-@salud_app.route("/health")
-def salud():
-    return "Bot de finanzas corriendo ✅", 200
-
-
-def iniciar_servidor_de_salud():
-    puerto = int(os.environ.get("PORT", 10000))
-    salud_app.run(host="0.0.0.0", port=puerto)
 
 
 async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,7 +35,8 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat_id != MY_CHAT_ID:
-        return
+        logger.warning(f"Mensaje ignorado de chat_id={chat_id} (no coincide con MY_TELEGRAM_CHAT_ID configurado)")
+        return  # ignoramos mensajes de cualquier otro chat
 
     try:
         respuesta = procesar_mensaje(texto)
@@ -91,12 +70,6 @@ def main():
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en tu archivo .env")
 
     db.init_db()
-
-    # Arrancamos el mini-servidor de salud en un hilo aparte, en paralelo al bot.
-    # daemon=True para que este hilo no impida que el programa cierre normalmente.
-    hilo_salud = threading.Thread(target=iniciar_servidor_de_salud, daemon=True)
-    hilo_salud.start()
-    logger.info(f"Servidor de salud escuchando en el puerto {os.environ.get('PORT', 10000)}")
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))

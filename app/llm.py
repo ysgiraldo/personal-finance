@@ -5,13 +5,12 @@ from anthropic import Anthropic
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-# Usamos Haiku porque la tarea (clasificar monto/categoria/tipo) es simple
-# y no necesita el modelo mas potente/caro.
+# Usamos Haiku porque la tarea (clasificar monto/categoria/tipo) es simple, no se necesita modelo potente
 MODELO = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = """
 
-Eres un asistente que extrae datos financieros de mensajes de texto en español (Colombia).
+Eres un asistente que extrae datos financieros de mensajes de texto en español coloquial (Colombia).
 
 Dado un mensaje, responde SOLO con un JSON valido (sin markdown, sin backticks, sin texto adicional) con esta forma exacta:
 
@@ -72,6 +71,8 @@ def interpretar_mensaje(texto):
     if bloque_texto is None:
         raise ValueError("El modelo no devolvio texto")
 
+    # A veces el modelo envuelve el JSON en un bloque de markdown
+    # (```json ... ```) a pesar de las instrucciones. Lo limpiamos antes de parsear.
     texto_limpio = bloque_texto.strip()
     texto_limpio = re.sub(r"^```(?:json)?\s*", "", texto_limpio)
     texto_limpio = re.sub(r"\s*```$", "", texto_limpio)
