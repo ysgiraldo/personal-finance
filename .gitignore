@@ -7,3 +7,11 @@ test-api
 
 __pycache__/
 logs/
+
+trust-policy.json
+dynamodb-policy.json
+
+# Despliegue AWS
+package/
+package.zip
+respuesta.json
