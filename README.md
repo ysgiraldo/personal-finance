@@ -1,158 +1,223 @@
-# Bot de Finanzas Personales (Python + Telegram + Claude)
+# Bot de Finanzas Personales (AWS Lambda + DynamoDB + Telegram)
 
-Misma lógica que las versiones anteriores, pero conectada por Telegram en vez
-de SMS/Twilio: gratis, sin verificación de negocio, y sin necesidad de ngrok
-para probarlo (usa "polling" en vez de webhook).
+Misma lógica de negocio que las versiones anteriores (Render/Telegram con
+polling), pero con arquitectura **serverless**: en vez de un proceso corriendo
+24/7 esperando mensajes, aquí el código **solo se ejecuta cuando hay algo que
+hacer** (llega un mensaje, o toca un resumen programado). Esto encaja con
+los niveles "Always Free" de AWS, que **no caducan**.
 
-## 1. Crear el bot en Telegram (2 minutos)
+## Qué cambió respecto a la versión de Telegram con polling?
 
-1. Abre Telegram y busca **@BotFather** (el bot oficial para crear bots).
-2. Escríbele `/newbot`.
-3. Te va a pedir un nombre para mostrar (ej. "Mis Finanzas") y un username
-   único que debe terminar en `bot` (ej. `misfinanzas_sofia_bot`).
-4. BotFather te va a dar un **token** parecido a
-   `123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`. Ese es tu `TELEGRAM_BOT_TOKEN`.
+- `telegram_bot.py` (que hacía polling con `python-telegram-bot`) se
+  reemplaza por `lambda_function.py`, mucho más simple: recibe un evento,
+  responde, termina.
+- `db.py` ahora usa **DynamoDB** (vía `boto3`) en vez de SQLite. Las
+  funciones tienen **exactamente los mismos nombres y firmas** que antes,
+  así que `core.py` y `goals.py` no cambiaron ni una línea.
+- Ya no se necesita `python-telegram-bot`, `flask`, ni `apscheduler`. Las
+  respuestas a Telegram se mandan con un cliente HTTP mínimo
+  (`app/telegram_api.py`), usando solo la librería estándar de Python.
+- Los resúmenes automáticos (semanal, alertas) ya no usan un scheduler
+  interno: los dispara **EventBridge Scheduler** desde afuera, invocando la
+  misma función Lambda con un payload distinto.
 
-## 2. Instalar dependencias
+## 1. Crear la tabla de DynamoDB
 
-```bash
-cd finanzas-bot-telegram
-python3 -m venv venv
-source venv/bin/activate      # en Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## 3. Configurar variables de entorno
-
-```bash
-cp .env.example .env
-```
-
-Edita `.env` y llena:
-- `ANTHROPIC_API_KEY`: tu API key de Anthropic.
-- `TELEGRAM_BOT_TOKEN`: el que te dio BotFather.
-- `MY_TELEGRAM_CHAT_ID`: **déjalo vacío por ahora**, lo llenamos en el siguiente paso.
-
-## 4. Primera corrida: obtener tu chat_id
+Con la consola de AWS (DynamoDB → "Create table") o con la CLI:
 
 ```bash
-python -m app.telegram_bot
+aws dynamodb create-table \
+  --table-name finanzas_bot \
+  --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+  --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST
 ```
 
-Abre Telegram, busca tu bot por el username que le pusiste, y mándale
-cualquier mensaje (ej. "hola"). El bot te va a responder con algo como:
+`PAY_PER_REQUEST` (on-demand) es la opción más simple para empezar — para
+el volumen de un bot personal, te vas a mantener muy por debajo del nivel
+gratuito de todas formas.
 
+## 2. Crear el rol de IAM para la función Lambda
+
+Necesita permiso para escribir logs (básico de cualquier Lambda) y para
+leer/escribir en la tabla de DynamoDB. Desde la consola de IAM, crea un rol
+con las políticas administradas `AWSLambdaBasicExecutionRole` y agrega una
+política inline con:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+               "dynamodb:DeleteItem", "dynamodb:Query"],
+    "Resource": "arn:aws:dynamodb:TU_REGION:TU_ACCOUNT_ID:table/finanzas_bot"
+  }]
+}
 ```
-Tu chat_id es: 987654321
 
-Copialo en tu archivo .env como MY_TELEGRAM_CHAT_ID y reinicia el bot
-para que solo tu puedas usarlo.
-```
+## 3. Empaquetar y crear la función Lambda
 
-Copia ese número en tu `.env`:
-```
-MY_TELEGRAM_CHAT_ID=987654321
-```
-
-Este paso es importante por seguridad: sin esto, el bot le respondería a
-**cualquier persona** que lo encuentre en Telegram y le escriba. Con el
-chat_id configurado, solo tú puedes usarlo.
-
-## 5. Reiniciar y usar de verdad
-
-Detén el bot (`Ctrl+C`) y vuelve a correrlo:
+Solo `anthropic` y `httpx` necesitan empaquetarse — `boto3` ya viene
+incluido en el runtime de Lambda, no lo agregues (aumentaría el tamaño del
+paquete sin necesidad).
 
 ```bash
-python -m app.telegram_bot
+cd finanzas-bot-lambda
+pip install -r requirements.txt -t package/
+cp -r app package/
+cp lambda_function.py package/
+cd package && zip -r ../despliegue.zip . && cd ..
 ```
 
-Ahora ya puedes escribirle normalmente:
+Sube `despliegue.zip` a una función Lambda nueva (consola o CLI):
+
+```bash
+aws lambda create-function \
+  --function-name finanzas-bot \
+  --runtime python3.12 \
+  --handler lambda_function.handler \
+  --role arn:aws:iam::TU_ACCOUNT_ID:role/TU_ROL \
+  --zip-file fileb://despliegue.zip \
+  --timeout 15 \
+  --memory-size 128
+```
+
+Configura las variables de entorno (consola → tu función → Configuration →
+Environment variables, o `aws lambda update-function-configuration`):
+
+- `ANTHROPIC_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `MY_TELEGRAM_CHAT_ID` (puedes dejarlo vacío al principio, ver paso 5)
+- `DYNAMODB_TABLE=finanzas_bot`
+
+## 4. Crear el API Gateway (para que Telegram te pueda "tocar la puerta")
+
+Crea una **HTTP API** (más simple y barata que una REST API clásica) con
+una sola ruta:
+
+```bash
+aws apigatewayv2 create-api \
+  --name finanzas-bot-api \
+  --protocol-type HTTP \
+  --target arn:aws:lambda:TU_REGION:TU_ACCOUNT_ID:function:finanzas-bot
+```
+
+Esto crea automáticamente una ruta `$default` que manda todo a tu Lambda.
+El comando te devuelve un `ApiEndpoint` — esa es tu URL pública, algo como:
 
 ```
-gaste 25000 en almuerzo
-```
-```
-resumen semanal
-```
-```
-definir presupuesto comida 600000
+https://abc123xyz.execute-api.us-east-1.amazonaws.com
 ```
 
-## 6. Comandos que entiende el bot
+**Importante**: dale permiso a API Gateway para invocar tu Lambda:
+
+```bash
+aws lambda add-permission \
+  --function-name finanzas-bot \
+  --statement-id apigateway-access \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:TU_REGION:TU_ACCOUNT_ID:*/*"
+```
+
+## 5. Configurar el webhook de Telegram (una sola vez)
+
+```bash
+export TELEGRAM_BOT_TOKEN=tu_token
+python configurar_webhook.py https://abc123xyz.execute-api.us-east-1.amazonaws.com
+```
+
+Deberías ver `{'ok': True, 'result': True, 'description': 'Webhook was set'}`.
+
+## 6. Obtener tu chat_id (igual que en la versión anterior)
+
+Escríbele a tu bot en Telegram. Como `MY_TELEGRAM_CHAT_ID` todavía está
+vacío, te va a responder con tu chat_id. Cópialo y actualiza la variable de
+entorno en tu función Lambda (no hace falta re-subir el código, solo
+actualizar la variable):
+
+```bash
+aws lambda update-function-configuration \
+  --function-name finanzas-bot \
+  --environment "Variables={ANTHROPIC_API_KEY=...,TELEGRAM_BOT_TOKEN=...,MY_TELEGRAM_CHAT_ID=TU_CHAT_ID,DYNAMODB_TABLE=finanzas_bot}"
+```
+
+## 7. Programar los resúmenes automáticos con EventBridge Scheduler
+
+A diferencia de los cron jobs que vivían dentro del proceso (como en la
+versión con polling), aquí un servicio externo de AWS "despierta" tu
+función Lambda en el horario que definas — la función ni siquiera está
+corriendo mientras tanto, por eso es gratis de verdad.
+
+```bash
+# Resumen semanal: domingos 8:00 PM hora Bogota
+aws scheduler create-schedule \
+  --name finanzas-resumen-semanal \
+  --schedule-expression "cron(0 20 ? * SUN *)" \
+  --schedule-expression-timezone "America/Bogota" \
+  --target "Arn=arn:aws:lambda:TU_REGION:TU_ACCOUNT_ID:function:finanzas-bot,RoleArn=arn:aws:iam::TU_ACCOUNT_ID:role/TU_ROL_DE_SCHEDULER,Input='{\"accion\":\"resumen_semanal\"}'" \
+  --flexible-time-window "Mode=OFF"
+
+# Alerta de presupuesto: todos los dias 9:00 AM hora Bogota
+aws scheduler create-schedule \
+  --name finanzas-alerta-presupuesto \
+  --schedule-expression "cron(0 9 * * ? *)" \
+  --schedule-expression-timezone "America/Bogota" \
+  --target "Arn=arn:aws:lambda:TU_REGION:TU_ACCOUNT_ID:function:finanzas-bot,RoleArn=arn:aws:iam::TU_ACCOUNT_ID:role/TU_ROL_DE_SCHEDULER,Input='{\"accion\":\"alerta_presupuesto\"}'" \
+  --flexible-time-window "Mode=OFF"
+```
+
+`EventBridge Scheduler` (a diferencia de las reglas clásicas de CloudWatch
+Events) soporta zonas horarias directamente con
+`--schedule-expression-timezone`, así que no hay que convertir manualmente a
+UTC. El `RoleArn` del scheduler necesita permiso `lambda:InvokeFunction`
+sobre tu función — es un rol de IAM aparte, con esa única política.
+
+## 8. Comandos que entiende el bot
+
+Son exactamente los mismos que en las versiones anteriores — nada cambió a
+nivel de lo que le puedes escribir:
 
 | Escribes | Qué hace |
 |---|---|
-| `gaste 25000 en almuerzo` | Registra un gasto (el LLM interpreta monto y categoría) |
+| `gaste 25000 en almuerzo` | Registra un gasto |
+| `compre 50000 en almuerzo con tarjeta de credito` | Registra el gasto y el medio de pago |
 | `me pagaron 2 millones de sueldo` | Registra un ingreso |
-| `ahorre 100 mil para el carro` | Registra un ahorro hacia el fondo "carro" (si no dices un fondo, usa "general") |
-| `resumen semanal` o `como voy` | Balance de los últimos 7 días |
-| `resumen mensual` o `proyeccion` | Proyección de cierre de mes por categoría |
-| `definir presupuesto comida 600000` | Define/actualiza el límite mensual de una categoría |
-| `definir presupuesto general 3000000` | Define un tope total de gasto mensual (todas las categorías) |
-| `definir fondo carro 5000000 2027-06-01` | Crea un fondo de ahorro con nombre, meta y fecha (ambas opcionales) |
-| `fondos` o `mis fondos` | Lista todos tus fondos con su progreso |
-| `fondo carro` | Progreso de un fondo específico |
-| `borrar fondo carro` | Elimina la definición de un fondo (el historial ahorrado se conserva) |
-| `definir gasto fijo arriendo 800000 vivienda` | Registra un gasto fijo recurrente (categoría opcional) |
-| `registrar gastos fijos` | Registra ya mismo los gastos fijos pendientes de este mes como transacciones reales |
-| `borrar gasto fijo arriendo` | Elimina un gasto fijo definido (deja de registrarse a futuro) |
-| `gastos fijos` | Lista tus gastos fijos definidos y qué % de tus ingresos representan |
-| `listar` o `listar 20` | Muestra tus últimas transacciones con su id (por defecto 10) |
-| `borrar 5` | Borra la transacción con id 5 |
-| `borrar ultimo` | Borra la transacción más reciente |
-| `editar 5 monto 30000` | Corrige el monto de la transacción con id 5 |
-| `editar 5 categoria transporte` | Corrige la categoría de la transacción con id 5 |
+| `ahorre 100 mil para el carro` | Ahorra hacia un fondo |
+| `retirar 200000 del carro` | Retira de un fondo |
+| `resumen semanal` / `como voy` | Balance de los últimos 7 días |
+| `resumen mensual` / `proyeccion` | Proyección de cierre de mes |
+| `definir presupuesto comida 600000` | Presupuesto por categoría |
+| `definir presupuesto general 3000000` | Presupuesto total del mes |
+| `definir fondo carro 5000000` | Crear fondo de ahorro |
+| `fondos` / `fondo carro` | Ver progreso de fondos |
+| `definir gasto fijo arriendo 800000` | Definir gasto fijo (no se registra solo) |
+| `registrar gastos fijos` | Registrar los gastos fijos pendientes del mes |
+| `balance por medio de pago` | Ver gastos agrupados por efectivo/tarjeta/etc |
+| `listar` / `borrar 5` / `editar 5 monto 30000` | Ver, borrar o editar transacciones |
 
-## 7. Cómo funcionan los fondos de ahorro
+## 9. Costo esperado
 
-En vez de una sola meta de ahorro genérica, puedes tener varios fondos con nombre propio (carro, estudio, fondo de emergencia, etc.):
+- **Lambda**: para un uso personal (unas cuantas invocaciones al día más los
+  2 jobs programados), estás muy por debajo del millón de invocaciones
+  gratis al mes. **$0**.
+- **DynamoDB**: con el volumen de datos de un bot personal (unos cuantos
+  KB), nunca te acercas a los 25 GB gratis. **$0**.
+- **API Gateway**: las HTTP API tienen 1 millón de llamadas gratis al mes
+  *solo durante los primeros 12 meses* de la cuenta; después cuesta
+  aproximadamente $1 USD por millón de llamadas — para tu volumen personal,
+  estamos hablando de fracciones de centavo, incluso pasado el año.
+- **Anthropic API**: el mismo estimado de siempre, menos de $1 USD/mes.
 
-1. Los defines con `definir fondo <nombre> <meta opcional> <fecha opcional>`.
-2. Cuando registras un ahorro (`ahorre 100 mil para el carro`), el LLM detecta el fondo destino a partir de lo que escribiste. Si no mencionas ninguno, se guarda bajo el fondo `"general"`.
-3. `fondos` te muestra el progreso de todos; `fondo carro` te muestra solo uno.
-4. El dinero se va acumulando indefinidamente (no se reinicia cada mes, a diferencia de los presupuestos) — tiene sentido porque una meta de ahorro es algo que construyes a lo largo de varios meses.
+## 10. Limitaciones de este diseño (para que las conozcas)
 
-## 8. Cómo funcionan los gastos fijos automáticos
-
-1. Los defines una sola vez con `definir gasto fijo <nombre> <monto> <categoria opcional>`.
-2. **El primer día de cada mes a las 8:00 AM**, el bot revisa todos tus gastos fijos y crea automáticamente la transacción de ese mes por cada uno — así sí cuentan dentro de tus presupuestos, proyecciones y resúmenes, como cualquier otro gasto.
-3. Si quieres que se registren antes de esa fecha (por ejemplo, para probar ahora mismo), escribe `registrar gastos fijos` — es seguro escribirlo varias veces, nunca duplica lo que ya se registró ese mes.
-4. `gastos fijos` (sin la palabra "registrar") sigue mostrando el listado de definiciones y qué porcentaje de tus ingresos representan, independientemente de si ya se registraron como transacción este mes.
-
-## 9. Resúmenes y alertas automáticas
-
-`app/telegram_bot.py` deja configurados tres jobs con el `JobQueue` propio de la librería (usa APScheduler por debajo, pero ya integrado):
-- **Resumen semanal**: domingos a las 8:00 PM (hora de Bogotá).
-- **Alerta de presupuesto**: todos los días a las 9:00 AM, solo si hay riesgo de superar algún presupuesto.
-- **Registro de gastos fijos**: el día 1 de cada mes a las 8:00 AM.
-
-Estos jobs solo se activan si `MY_TELEGRAM_CHAT_ID` ya está configurado.
-
-## Diferencias clave frente a la versión con Twilio/SMS
-
-- **Sin costo por mensaje**: la API de bots de Telegram es 100% gratuita.
-- **Sin ngrok para desarrollo**: usamos "polling" (`app.run_polling()`), el
-  bot pregunta activamente a Telegram por mensajes nuevos, no necesita una
-  URL pública. Para producción también puedes cambiar a webhook si quieres,
-  pero polling funciona bien incluso desplegado.
-- **Autenticación por chat_id** en vez de número de teléfono — mismo
-  concepto de seguridad (solo tú puedes usar el bot), solo cambia el dato
-  que se compara.
-- Ya no se usa Flask ni Gunicorn: `app/telegram_bot.py` es un script que
-  corre directamente con `python -m app.telegram_bot` (para producción,
-  igual conviene correrlo con un supervisor de procesos, ver abajo).
-
-## 10. Desplegarlo para que corra 24/7
-
-Como no depende de un webhook HTTP expuesto, desplegarlo es aún más simple:
-en Render/Railway, en vez de un "Web Service" usas un **"Background Worker"**
-(o su equivalente) que simplemente corre `python -m app.telegram_bot` de
-forma continua. No necesitas configurar ninguna URL pública ni dominio.
-
-## Próximos pasos sugeridos (no incluidos en este prototipo)
-
-- Fecha de inicio real para la meta de ahorro (para calcular si vas
-  "adelantado o atrasado" con precisión).
-- Editar/borrar un registro por error (ej. "borra el ultimo gasto").
-- Comandos nativos de Telegram con botones (`/start`, `/ayuda`) en vez de
-  solo texto libre, usando `CommandHandler` de la misma librería.
+- **Sin indices secundarios**: todas las consultas (transacciones del mes,
+  de la semana, etc.) traen TODOS los registros de ese tipo y filtran en
+  Python. Para el volumen de un bot personal (cientos o pocos miles de
+  transacciones a lo largo de años) esto es perfectamente eficiente y
+  barato; si algún día esto creciera muchísimo (miles de transacciones por
+  día), convendría rediseñar con índices secundarios globales (GSI).
+- **Cold starts**: la primera invocación después de un rato sin uso tarda
+  un poco más (1-2 segundos) mientras Lambda "despierta" el contenedor. Para
+  un bot personal esto es imperceptible en la práctica.

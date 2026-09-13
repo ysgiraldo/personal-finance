@@ -1,349 +1,308 @@
-import sqlite3
-from pathlib import Path
+import os
+import boto3
+from decimal import Decimal
 from datetime import datetime, timedelta
+from boto3.dynamodb.conditions import Key
 
-DB_PATH = Path(__file__).parent.parent / "data" / "finanzas.db"
+TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "finanzas_bot")
+
+_dynamodb = boto3.resource("dynamodb")
+_tabla = _dynamodb.Table(TABLE_NAME)
 
 
-def conectar():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# --- Helpers de conversion (DynamoDB usa Decimal, el resto del codigo usa float) ---
+
+def _f(valor):
+    """Decimal (o None) -> float (o None). Evita TypeErrors al mezclar Decimal con float."""
+    if valor is None:
+        return None
+    return float(valor)
+
+
+def _dec(valor):
+    """float (o None) -> Decimal (o None). DynamoDB no acepta float directamente."""
+    if valor is None:
+        return None
+    return Decimal(str(valor))
 
 
 def init_db():
-    conn = conectar()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS transacciones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT NOT NULL,          -- YYYY-MM-DD
-            tipo TEXT NOT NULL,           -- 'gasto' | 'ingreso' | 'ahorro'
-            monto REAL NOT NULL,
-            categoria TEXT NOT NULL,      -- para tipo 'ahorro', aqui va el NOMBRE DEL FONDO
-            descripcion TEXT,
-            creado_en TEXT DEFAULT (datetime('now'))
-        );
+    """No-op: la tabla de DynamoDB se crea con infraestructura (consola/CLI/CloudFormation),
+    no en tiempo de ejecucion como hacíamos con sqlite3.executescript()."""
+    pass
 
-        CREATE TABLE IF NOT EXISTS metas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            categoria TEXT UNIQUE,        -- NULL si es el presupuesto general
-            tipo TEXT NOT NULL,           -- 'presupuesto' | 'presupuesto_general'
-            limite_mensual REAL
-        );
 
-        CREATE TABLE IF NOT EXISTS gastos_fijos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT UNIQUE NOT NULL,   -- ej. 'arriendo', 'netflix'
-            monto_mensual REAL NOT NULL,
-            categoria TEXT
-        );
+# --- Transacciones ---
 
-        CREATE TABLE IF NOT EXISTS registros_gastos_fijos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            gasto_fijo_id INTEGER NOT NULL,
-            mes TEXT NOT NULL,             -- 'YYYY-MM'
-            transaccion_id INTEGER,
-            UNIQUE(gasto_fijo_id, mes)
-        );
-
-        CREATE TABLE IF NOT EXISTS fondos_ahorro (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT UNIQUE NOT NULL,   -- ej. 'carro', 'estudio', 'emergencia'
-            monto_objetivo REAL,
-            fecha_objetivo TEXT            -- YYYY-MM-DD, opcional
-        );
-        """
+def _siguiente_id_transaccion():
+    """Contador atomico (equivalente al AUTOINCREMENT de SQLite)."""
+    respuesta = _tabla.update_item(
+        Key={"PK": "COUNTER", "SK": "TXN"},
+        UpdateExpression="ADD #v :incr",
+        ExpressionAttributeNames={"#v": "valor"},
+        ExpressionAttributeValues={":incr": 1},
+        ReturnValues="UPDATED_NEW",
     )
-
-    # Migracion segura: si la base de datos ya existia (de una version anterior
-    # sin medio_pago), agregamos la columna sin perder los datos existentes.
-    columnas = [fila["name"] for fila in conn.execute("PRAGMA table_info(transacciones)").fetchall()]
-    if "medio_pago" not in columnas:
-        conn.execute("ALTER TABLE transacciones ADD COLUMN medio_pago TEXT")
-
-    conn.commit()
-    conn.close()
+    return int(respuesta["Attributes"]["valor"])
 
 
 def agregar_transaccion(fecha, tipo, monto, categoria, descripcion, medio_pago=None):
-    """Devuelve el id de la transaccion recien creada (util para los gastos fijos,
-    que necesitan enlazar la transaccion generada con su registro mensual)."""
-    conn = conectar()
-    cursor = conn.execute(
-        """INSERT INTO transacciones (fecha, tipo, monto, categoria, descripcion, medio_pago)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (fecha, tipo, monto, categoria, descripcion, medio_pago),
-    )
-    conn.commit()
-    nuevo_id = cursor.lastrowid
-    conn.close()
+    nuevo_id = _siguiente_id_transaccion()
+    item = {
+        "PK": "TXN",
+        "SK": f"{nuevo_id:010d}",
+        "id": nuevo_id,
+        "fecha": fecha,
+        "tipo": tipo,
+        "monto": _dec(monto),
+        "categoria": categoria,
+        "descripcion": descripcion or "",
+    }
+    if medio_pago:
+        item["medio_pago"] = medio_pago
+    _tabla.put_item(Item=item)
     return nuevo_id
+
+
+def _item_a_transaccion(item):
+    return {
+        "id": item["id"],
+        "fecha": item["fecha"],
+        "tipo": item["tipo"],
+        "monto": _f(item["monto"]),
+        "categoria": item["categoria"],
+        "descripcion": item.get("descripcion", ""),
+        "medio_pago": item.get("medio_pago"),
+    }
+
+
+def _todas_las_transacciones():
+    """Trae todas las transacciones (volumen personal = pequeno, no hace falta
+    paginar ni optimizar con indices secundarios)."""
+    resultado = []
+    respuesta = _tabla.query(KeyConditionExpression=Key("PK").eq("TXN"))
+    resultado.extend(respuesta["Items"])
+    while "LastEvaluatedKey" in respuesta:
+        respuesta = _tabla.query(
+            KeyConditionExpression=Key("PK").eq("TXN"),
+            ExclusiveStartKey=respuesta["LastEvaluatedKey"],
+        )
+        resultado.extend(respuesta["Items"])
+    return [_item_a_transaccion(i) for i in resultado]
 
 
 def transacciones_del_mes(categoria=None, tipo=None, fecha_ref=None):
     fecha_ref = fecha_ref or datetime.now()
     prefijo = fecha_ref.strftime("%Y-%m")
 
-    query = "SELECT * FROM transacciones WHERE fecha LIKE ?"
-    params = [f"{prefijo}%"]
-
+    transacciones = [t for t in _todas_las_transacciones() if t["fecha"].startswith(prefijo)]
     if categoria:
-        query += " AND categoria = ?"
-        params.append(categoria)
+        transacciones = [t for t in transacciones if t["categoria"] == categoria]
     if tipo:
-        query += " AND tipo = ?"
-        params.append(tipo)
-
-    conn = conectar()
-    filas = conn.execute(query, params).fetchall()
-    conn.close()
-    return filas
+        transacciones = [t for t in transacciones if t["tipo"] == tipo]
+    return transacciones
 
 
 def transacciones_de_la_semana():
     hace_una_semana = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    conn = conectar()
-    filas = conn.execute(
-        "SELECT * FROM transacciones WHERE fecha >= ?", (hace_una_semana,)
-    ).fetchall()
-    conn.close()
-    return filas
+    return [t for t in _todas_las_transacciones() if t["fecha"] >= hace_una_semana]
 
-
-def obtener_meta(categoria):
-    conn = conectar()
-    fila = conn.execute(
-        "SELECT * FROM metas WHERE categoria = ?", (categoria,)
-    ).fetchone()
-    conn.close()
-    return fila
-
-
-def obtener_todas_las_metas():
-    conn = conectar()
-    filas = conn.execute("SELECT * FROM metas").fetchall()
-    conn.close()
-    return filas
-
-
-def definir_presupuesto(categoria, limite_mensual):
-    conn = conectar()
-    conn.execute(
-        """INSERT INTO metas (categoria, tipo, limite_mensual)
-           VALUES (?, 'presupuesto', ?)
-           ON CONFLICT(categoria) DO UPDATE SET limite_mensual = excluded.limite_mensual""",
-        (categoria, limite_mensual),
-    )
-    conn.commit()
-    conn.close()
-
-
-# --- Presupuesto general (no por categoria, sino un tope total del mes) ---
-
-def definir_presupuesto_general(limite_mensual):
-    conn = conectar()
-    conn.execute("DELETE FROM metas WHERE tipo = 'presupuesto_general'")
-    conn.execute(
-        """INSERT INTO metas (tipo, limite_mensual) VALUES ('presupuesto_general', ?)""",
-        (limite_mensual,),
-    )
-    conn.commit()
-    conn.close()
-
-
-def obtener_presupuesto_general():
-    conn = conectar()
-    fila = conn.execute(
-        "SELECT * FROM metas WHERE tipo = 'presupuesto_general'"
-    ).fetchone()
-    conn.close()
-    return fila
-
-
-# --- Editar / borrar transacciones (para corregir equivocaciones) ---
 
 def obtener_transaccion(id_transaccion):
-    conn = conectar()
-    fila = conn.execute(
-        "SELECT * FROM transacciones WHERE id = ?", (id_transaccion,)
-    ).fetchone()
-    conn.close()
-    return fila
+    respuesta = _tabla.get_item(Key={"PK": "TXN", "SK": f"{id_transaccion:010d}"})
+    item = respuesta.get("Item")
+    return _item_a_transaccion(item) if item else None
 
 
 def ultimas_transacciones(limite=10):
-    conn = conectar()
-    filas = conn.execute(
-        "SELECT * FROM transacciones ORDER BY id DESC LIMIT ?", (limite,)
-    ).fetchall()
-    conn.close()
-    return filas
+    respuesta = _tabla.query(
+        KeyConditionExpression=Key("PK").eq("TXN"),
+        ScanIndexForward=False,  # descendente, las mas nuevas primero
+        Limit=limite,
+    )
+    return [_item_a_transaccion(i) for i in respuesta["Items"]]
 
 
 def eliminar_transaccion(id_transaccion):
-    conn = conectar()
-    cursor = conn.execute("DELETE FROM transacciones WHERE id = ?", (id_transaccion,))
-    conn.commit()
-    filas_afectadas = cursor.rowcount
-    conn.close()
-    return filas_afectadas > 0
+    respuesta = _tabla.delete_item(
+        Key={"PK": "TXN", "SK": f"{id_transaccion:010d}"},
+        ReturnValues="ALL_OLD",
+    )
+    return "Attributes" in respuesta
 
 
 def editar_monto_transaccion(id_transaccion, nuevo_monto):
-    conn = conectar()
-    cursor = conn.execute(
-        "UPDATE transacciones SET monto = ? WHERE id = ?", (nuevo_monto, id_transaccion)
+    sk = f"{id_transaccion:010d}"
+    if not obtener_transaccion(id_transaccion):
+        return False
+    _tabla.update_item(
+        Key={"PK": "TXN", "SK": sk},
+        UpdateExpression="SET monto = :m",
+        ExpressionAttributeValues={":m": _dec(nuevo_monto)},
     )
-    conn.commit()
-    filas_afectadas = cursor.rowcount
-    conn.close()
-    return filas_afectadas > 0
+    return True
 
 
 def editar_categoria_transaccion(id_transaccion, nueva_categoria):
-    conn = conectar()
-    cursor = conn.execute(
-        "UPDATE transacciones SET categoria = ? WHERE id = ?", (nueva_categoria, id_transaccion)
+    sk = f"{id_transaccion:010d}"
+    if not obtener_transaccion(id_transaccion):
+        return False
+    _tabla.update_item(
+        Key={"PK": "TXN", "SK": sk},
+        UpdateExpression="SET categoria = :c",
+        ExpressionAttributeValues={":c": nueva_categoria},
     )
-    conn.commit()
-    filas_afectadas = cursor.rowcount
-    conn.close()
-    return filas_afectadas > 0
+    return True
 
 
-# --- Gastos fijos (recurrentes: arriendo, suscripciones, etc.) ---
+# --- Metas (presupuesto por categoria y presupuesto general) ---
+
+def obtener_meta(categoria):
+    respuesta = _tabla.get_item(Key={"PK": "META", "SK": f"CAT#{categoria}"})
+    item = respuesta.get("Item")
+    if not item:
+        return None
+    return {"categoria": item["categoria"], "tipo": item["tipo"], "limite_mensual": _f(item["limite_mensual"])}
+
+
+def obtener_todas_las_metas():
+    respuesta = _tabla.query(KeyConditionExpression=Key("PK").eq("META"))
+    metas = []
+    for item in respuesta["Items"]:
+        metas.append({
+            "categoria": item.get("categoria"),
+            "tipo": item["tipo"],
+            "limite_mensual": _f(item.get("limite_mensual")),
+        })
+    return metas
+
+
+def definir_presupuesto(categoria, limite_mensual):
+    _tabla.put_item(Item={
+        "PK": "META", "SK": f"CAT#{categoria}",
+        "categoria": categoria, "tipo": "presupuesto",
+        "limite_mensual": _dec(limite_mensual),
+    })
+
+
+def definir_presupuesto_general(limite_mensual):
+    _tabla.put_item(Item={
+        "PK": "META", "SK": "GENERAL",
+        "tipo": "presupuesto_general",
+        "limite_mensual": _dec(limite_mensual),
+    })
+
+
+def obtener_presupuesto_general():
+    respuesta = _tabla.get_item(Key={"PK": "META", "SK": "GENERAL"})
+    item = respuesta.get("Item")
+    if not item:
+        return None
+    return {"tipo": item["tipo"], "limite_mensual": _f(item["limite_mensual"])}
+
+
+# --- Gastos fijos ---
 
 def definir_gasto_fijo(nombre, monto_mensual, categoria=None):
-    conn = conectar()
-    conn.execute(
-        """INSERT INTO gastos_fijos (nombre, monto_mensual, categoria)
-           VALUES (?, ?, ?)
-           ON CONFLICT(nombre) DO UPDATE SET
-             monto_mensual = excluded.monto_mensual,
-             categoria = excluded.categoria""",
-        (nombre, monto_mensual, categoria),
-    )
-    conn.commit()
-    conn.close()
+    _tabla.put_item(Item={
+        "PK": "GASTO_FIJO", "SK": nombre,
+        "nombre": nombre, "monto_mensual": _dec(monto_mensual),
+        "categoria": categoria or nombre,
+    })
 
 
 def eliminar_gasto_fijo(nombre):
-    conn = conectar()
-    cursor = conn.execute("DELETE FROM gastos_fijos WHERE nombre = ?", (nombre,))
-    conn.commit()
-    filas_afectadas = cursor.rowcount
-    conn.close()
-    return filas_afectadas > 0
+    respuesta = _tabla.delete_item(Key={"PK": "GASTO_FIJO", "SK": nombre}, ReturnValues="ALL_OLD")
+    return "Attributes" in respuesta
 
 
 def obtener_gastos_fijos():
-    conn = conectar()
-    filas = conn.execute("SELECT * FROM gastos_fijos ORDER BY nombre").fetchall()
-    conn.close()
-    return filas
+    respuesta = _tabla.query(KeyConditionExpression=Key("PK").eq("GASTO_FIJO"))
+    gastos = [{
+        "nombre": i["nombre"], "monto_mensual": _f(i["monto_mensual"]), "categoria": i.get("categoria"),
+    } for i in respuesta["Items"]]
+    return sorted(gastos, key=lambda g: g["nombre"])
 
 
-def gasto_fijo_ya_registrado_este_mes(gasto_fijo_id, mes):
-    conn = conectar()
-    fila = conn.execute(
-        "SELECT 1 FROM registros_gastos_fijos WHERE gasto_fijo_id = ? AND mes = ?",
-        (gasto_fijo_id, mes),
-    ).fetchone()
-    conn.close()
-    return fila is not None
+def gasto_fijo_ya_registrado_este_mes(nombre_gasto_fijo, mes):
+    respuesta = _tabla.get_item(Key={"PK": "REGISTRO_FIJO", "SK": f"{nombre_gasto_fijo}#{mes}"})
+    return "Item" in respuesta
 
 
-def marcar_gasto_fijo_registrado(gasto_fijo_id, mes, transaccion_id):
-    conn = conectar()
-    conn.execute(
-        """INSERT INTO registros_gastos_fijos (gasto_fijo_id, mes, transaccion_id)
-           VALUES (?, ?, ?)""",
-        (gasto_fijo_id, mes, transaccion_id),
-    )
-    conn.commit()
-    conn.close()
+def marcar_gasto_fijo_registrado(nombre_gasto_fijo, mes, transaccion_id):
+    _tabla.put_item(Item={
+        "PK": "REGISTRO_FIJO", "SK": f"{nombre_gasto_fijo}#{mes}",
+        "nombre": nombre_gasto_fijo, "mes": mes, "transaccion_id": transaccion_id,
+    })
 
 
 def registrar_gastos_fijos_pendientes(fecha_ref=None):
     """Revisa todos los gastos fijos definidos y crea la transaccion del mes
-    para los que aun no se hayan registrado. Es seguro llamarla varias veces
-    en el mismo mes: no duplica los que ya estan registrados.
-    Devuelve la lista de gastos fijos que se registraron en esta llamada."""
+    para los que aun no se hayan registrado. Seguro de llamar varias veces:
+    no duplica los que ya estan registrados ese mes."""
     fecha_ref = fecha_ref or datetime.now()
     mes_actual = fecha_ref.strftime("%Y-%m")
     fecha_hoy = fecha_ref.strftime("%Y-%m-%d")
 
     registrados_ahora = []
-
     for gasto_fijo in obtener_gastos_fijos():
-        if gasto_fijo_ya_registrado_este_mes(gasto_fijo["id"], mes_actual):
+        if gasto_fijo_ya_registrado_este_mes(gasto_fijo["nombre"], mes_actual):
             continue
-
         transaccion_id = agregar_transaccion(
-            fecha=fecha_hoy,
-            tipo="gasto",
-            monto=gasto_fijo["monto_mensual"],
+            fecha=fecha_hoy, tipo="gasto", monto=gasto_fijo["monto_mensual"],
             categoria=gasto_fijo["categoria"] or gasto_fijo["nombre"],
             descripcion=f"{gasto_fijo['nombre']} (gasto fijo)",
         )
-        marcar_gasto_fijo_registrado(gasto_fijo["id"], mes_actual, transaccion_id)
+        marcar_gasto_fijo_registrado(gasto_fijo["nombre"], mes_actual, transaccion_id)
         registrados_ahora.append(gasto_fijo)
 
     return registrados_ahora
 
 
-# --- Fondos de ahorro (metas de ahorro con nombre propio: carro, estudio, etc.) ---
+# --- Fondos de ahorro ---
 
 def definir_fondo(nombre, monto_objetivo=None, fecha_objetivo=None):
-    conn = conectar()
-    conn.execute(
-        """INSERT INTO fondos_ahorro (nombre, monto_objetivo, fecha_objetivo)
-           VALUES (?, ?, ?)
-           ON CONFLICT(nombre) DO UPDATE SET
-             monto_objetivo = COALESCE(excluded.monto_objetivo, fondos_ahorro.monto_objetivo),
-             fecha_objetivo = COALESCE(excluded.fecha_objetivo, fondos_ahorro.fecha_objetivo)""",
-        (nombre, monto_objetivo, fecha_objetivo),
-    )
-    conn.commit()
-    conn.close()
+    existente = obtener_fondo(nombre)
+    item = {
+        "PK": "FONDO", "SK": nombre, "nombre": nombre,
+        "monto_objetivo": _dec(monto_objetivo) if monto_objetivo is not None else (
+            _dec(existente["monto_objetivo"]) if existente and existente.get("monto_objetivo") is not None else None
+        ),
+        "fecha_objetivo": fecha_objetivo or (existente["fecha_objetivo"] if existente else None),
+    }
+    # DynamoDB no permite guardar attribute con valor None: lo quitamos si aplica
+    item = {k: v for k, v in item.items() if v is not None}
+    _tabla.put_item(Item=item)
 
 
 def eliminar_fondo(nombre):
-    conn = conectar()
-    cursor = conn.execute("DELETE FROM fondos_ahorro WHERE nombre = ?", (nombre,))
-    conn.commit()
-    filas_afectadas = cursor.rowcount
-    conn.close()
-    return filas_afectadas > 0
+    respuesta = _tabla.delete_item(Key={"PK": "FONDO", "SK": nombre}, ReturnValues="ALL_OLD")
+    return "Attributes" in respuesta
 
 
 def obtener_fondo(nombre):
-    conn = conectar()
-    fila = conn.execute("SELECT * FROM fondos_ahorro WHERE nombre = ?", (nombre,)).fetchone()
-    conn.close()
-    return fila
+    respuesta = _tabla.get_item(Key={"PK": "FONDO", "SK": nombre})
+    item = respuesta.get("Item")
+    if not item:
+        return None
+    return {
+        "nombre": item["nombre"],
+        "monto_objetivo": _f(item.get("monto_objetivo")),
+        "fecha_objetivo": item.get("fecha_objetivo"),
+    }
 
 
 def obtener_todos_los_fondos():
-    conn = conectar()
-    filas = conn.execute("SELECT * FROM fondos_ahorro ORDER BY nombre").fetchall()
-    conn.close()
-    return filas
+    respuesta = _tabla.query(KeyConditionExpression=Key("PK").eq("FONDO"))
+    fondos = [{
+        "nombre": i["nombre"], "monto_objetivo": _f(i.get("monto_objetivo")), "fecha_objetivo": i.get("fecha_objetivo"),
+    } for i in respuesta["Items"]]
+    return sorted(fondos, key=lambda f: f["nombre"])
 
 
 def total_ahorrado_fondo(nombre):
-    """Suma TODO el historico ahorrado hacia un fondo, restando lo que se haya
-    retirado de ese mismo fondo (tipo 'retiro_ahorro'). No se limita al mes
-    actual, ya que un fondo de ahorro se acumula a lo largo de varios meses."""
-    conn = conectar()
-    fila_ahorro = conn.execute(
-        "SELECT COALESCE(SUM(monto), 0) as total FROM transacciones WHERE tipo = 'ahorro' AND categoria = ?",
-        (nombre,),
-    ).fetchone()
-    fila_retiro = conn.execute(
-        "SELECT COALESCE(SUM(monto), 0) as total FROM transacciones WHERE tipo = 'retiro_ahorro' AND categoria = ?",
-        (nombre,),
-    ).fetchone()
-    conn.close()
-    return fila_ahorro["total"] - fila_retiro["total"]
+    """Suma el historico ahorrado hacia un fondo, restando los retiros de ese mismo fondo."""
+    todas = _todas_las_transacciones()
+    ahorrado = sum(t["monto"] for t in todas if t["tipo"] == "ahorro" and t["categoria"] == nombre)
+    retirado = sum(t["monto"] for t in todas if t["tipo"] == "retiro_ahorro" and t["categoria"] == nombre)
+    return ahorrado - retirado
