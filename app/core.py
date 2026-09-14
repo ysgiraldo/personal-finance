@@ -154,6 +154,14 @@ def procesar_mensaje(texto):
             return f"Transaccion #{id_transaccion} actualizada a categoria '{nueva_categoria}'."
         return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
 
+    match_editar_fecha = re.match(r"^editar (\d+) fecha (\d{4}-\d{2}-\d{2})$", texto_limpio)
+    if match_editar_fecha:
+        id_transaccion, nueva_fecha = match_editar_fecha.groups()
+        id_transaccion = int(id_transaccion)
+        if db.editar_fecha_transaccion(id_transaccion, nueva_fecha):
+            return f"Transaccion #{id_transaccion} actualizada a la fecha {nueva_fecha}."
+        return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
+
     # Si no es un comando conocido, lo interpretamos como un movimiento financiero
     datos = interpretar_mensaje(texto_original)
 
@@ -161,7 +169,7 @@ def procesar_mensaje(texto):
         return 'No entendi ese mensaje como un movimiento financiero. Prueba algo como "gaste 25000 en almuerzo".'
 
     db.agregar_transaccion(
-        fecha=hoy_iso(),
+        fecha=datos["fecha"],
         tipo=datos["tipo"],
         monto=datos["monto"],
         categoria=datos["categoria"],
@@ -169,10 +177,13 @@ def procesar_mensaje(texto):
         medio_pago=datos.get("medio_pago"),
     )
 
+    fecha_es_hoy = datos["fecha"] == hoy_iso()
+    sufijo_fecha = "" if fecha_es_hoy else f" (el {datos['fecha']})"
+
     if datos["tipo"] == "retiro_ahorro":
-        respuesta = f"Registrado: retiro de {goals.formato_pesos(datos['monto'])} del fondo '{datos['categoria']}'."
+        respuesta = f"Registrado: retiro de {goals.formato_pesos(datos['monto'])} del fondo '{datos['categoria']}'{sufijo_fecha}."
     else:
-        respuesta = f"Registrado: {goals.formato_pesos(datos['monto'])} ({datos['tipo']}) en {datos['categoria']}."
+        respuesta = f"Registrado: {goals.formato_pesos(datos['monto'])} ({datos['tipo']}) en {datos['categoria']}{sufijo_fecha}."
         if datos.get("medio_pago"):
             respuesta += f" — {goals.NOMBRES_MEDIO_PAGO.get(datos['medio_pago'], datos['medio_pago'])}"
 
