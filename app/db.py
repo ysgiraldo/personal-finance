@@ -155,6 +155,18 @@ def editar_categoria_transaccion(id_transaccion, nueva_categoria):
     return True
 
 
+def editar_fecha_transaccion(id_transaccion, nueva_fecha):
+    sk = f"{id_transaccion:010d}"
+    if not obtener_transaccion(id_transaccion):
+        return False
+    _tabla.update_item(
+        Key={"PK": "TXN", "SK": sk},
+        UpdateExpression="SET fecha = :f",
+        ExpressionAttributeValues={":f": nueva_fecha},
+    )
+    return True
+
+
 # --- Metas (presupuesto por categoria y presupuesto general) ---
 
 def obtener_meta(categoria):

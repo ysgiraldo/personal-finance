@@ -221,3 +221,21 @@ nivel de lo que le puedes escribir:
 - **Cold starts**: la primera invocación después de un rato sin uso tarda
   un poco más (1-2 segundos) mientras Lambda "despierta" el contenedor. Para
   un bot personal esto es imperceptible en la práctica.
+
+## Estructura del bot en AWS
+```
+Webhook → es el mecanismo/dirección mediante el cual Telegram envía los eventos.
+API Gateway → es la puerta de entrada HTTP que recibe esos eventos.
+Lambda → es quien procesa el evento.
+DynamoDB → donde guardas la información.
+```
+
+O como una analogía
+
+```
+Telegram → persona que envía una carta
+Webhook → dirección de envío
+API Gateway → recepción del edificio
+Lambda → empleado que procesa la carta
+DynamoDB → archivador donde guarda la información
+```
