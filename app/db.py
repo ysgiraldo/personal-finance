@@ -1,8 +1,11 @@
 import os
 import boto3
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import timedelta
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
+from .utils import ahora
 
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "finanzas_bot")
 
@@ -66,7 +69,7 @@ def agregar_transaccion(fecha, tipo, monto, categoria, descripcion, medio_pago=N
 
 def _item_a_transaccion(item):
     return {
-        "id": item["id"],
+        "id": int(item["id"]),  # DynamoDB lo devuelve como Decimal; sin int() falla f"{id:010d}"
         "fecha": item["fecha"],
         "tipo": item["tipo"],
         "monto": _f(item["monto"]),
@@ -91,8 +94,14 @@ def _todas_las_transacciones():
     return [_item_a_transaccion(i) for i in resultado]
 
 
+def todas_las_transacciones():
+    """Version publica de _todas_las_transacciones (la usa analisis.py para
+    leer la tabla UNA sola vez y calcular todo en memoria)."""
+    return _todas_las_transacciones()
+
+
 def transacciones_del_mes(categoria=None, tipo=None, fecha_ref=None):
-    fecha_ref = fecha_ref or datetime.now()
+    fecha_ref = fecha_ref or ahora()
     prefijo = fecha_ref.strftime("%Y-%m")
 
     transacciones = [t for t in _todas_las_transacciones() if t["fecha"].startswith(prefijo)]
@@ -104,7 +113,7 @@ def transacciones_del_mes(categoria=None, tipo=None, fecha_ref=None):
 
 
 def transacciones_de_la_semana():
-    hace_una_semana = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    hace_una_semana = (ahora() - timedelta(days=7)).strftime("%Y-%m-%d")
     return [t for t in _todas_las_transacciones() if t["fecha"] >= hace_una_semana]
 
 
@@ -131,40 +140,74 @@ def eliminar_transaccion(id_transaccion):
     return "Attributes" in respuesta
 
 
+CAMPOS_EDITABLES = ("fecha", "tipo", "monto", "categoria", "descripcion", "medio_pago")
+
+
+def actualizar_transaccion(id_transaccion, cambios):
+    """Modifica campos de una transaccion YA EXISTENTE.
+
+    - `cambios` es un dict {campo: valor}. Un valor None elimina el campo
+      (solo tiene sentido para medio_pago).
+    - Devuelve (antes, despues) con la transaccion antes y despues del cambio,
+      o None si el id no existe.
+    - NUNCA crea una transaccion nueva: update_item de DynamoDB hace "upsert"
+      por defecto (si la llave no existe, la crea). El ConditionExpression
+      attribute_exists(PK) lo impide y ademas evita la carrera entre el
+      get_item previo y el update.
+    """
+    cambios = {c: v for c, v in cambios.items() if c in CAMPOS_EDITABLES}
+    if not cambios:
+        raise ValueError("No hay campos validos para editar")
+
+    asignaciones, eliminaciones = [], []
+    nombres, valores = {}, {}
+    for i, (campo, valor) in enumerate(cambios.items()):
+        nombres[f"#c{i}"] = campo
+        if valor is None:
+            eliminaciones.append(f"#c{i}")
+        else:
+            valores[f":v{i}"] = _dec(valor) if campo == "monto" else valor
+            asignaciones.append(f"#c{i} = :v{i}")
+
+    partes = []
+    if asignaciones:
+        partes.append("SET " + ", ".join(asignaciones))
+    if eliminaciones:
+        partes.append("REMOVE " + ", ".join(eliminaciones))
+
+    argumentos = {
+        "Key": {"PK": "TXN", "SK": f"{id_transaccion:010d}"},
+        "UpdateExpression": " ".join(partes),
+        "ConditionExpression": "attribute_exists(PK)",
+        "ExpressionAttributeNames": nombres,
+        "ReturnValues": "ALL_OLD",
+    }
+    if valores:  # DynamoDB rechaza un ExpressionAttributeValues vacio
+        argumentos["ExpressionAttributeValues"] = valores
+
+    try:
+        respuesta = _tabla.update_item(**argumentos)
+    except ClientError as err:
+        if err.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise
+
+    antes = _item_a_transaccion(respuesta["Attributes"])
+    despues = {**antes, **cambios}
+    return antes, despues
+
+
+# Atajos que ya existian (se conservan por compatibilidad)
 def editar_monto_transaccion(id_transaccion, nuevo_monto):
-    sk = f"{id_transaccion:010d}"
-    if not obtener_transaccion(id_transaccion):
-        return False
-    _tabla.update_item(
-        Key={"PK": "TXN", "SK": sk},
-        UpdateExpression="SET monto = :m",
-        ExpressionAttributeValues={":m": _dec(nuevo_monto)},
-    )
-    return True
+    return actualizar_transaccion(id_transaccion, {"monto": nuevo_monto}) is not None
 
 
 def editar_categoria_transaccion(id_transaccion, nueva_categoria):
-    sk = f"{id_transaccion:010d}"
-    if not obtener_transaccion(id_transaccion):
-        return False
-    _tabla.update_item(
-        Key={"PK": "TXN", "SK": sk},
-        UpdateExpression="SET categoria = :c",
-        ExpressionAttributeValues={":c": nueva_categoria},
-    )
-    return True
+    return actualizar_transaccion(id_transaccion, {"categoria": nueva_categoria}) is not None
 
 
 def editar_fecha_transaccion(id_transaccion, nueva_fecha):
-    sk = f"{id_transaccion:010d}"
-    if not obtener_transaccion(id_transaccion):
-        return False
-    _tabla.update_item(
-        Key={"PK": "TXN", "SK": sk},
-        UpdateExpression="SET fecha = :f",
-        ExpressionAttributeValues={":f": nueva_fecha},
-    )
-    return True
+    return actualizar_transaccion(id_transaccion, {"fecha": nueva_fecha}) is not None
 
 
 # --- Metas (presupuesto por categoria y presupuesto general) ---
@@ -252,7 +295,7 @@ def registrar_gastos_fijos_pendientes(fecha_ref=None):
     """Revisa todos los gastos fijos definidos y crea la transaccion del mes
     para los que aun no se hayan registrado. Seguro de llamar varias veces:
     no duplica los que ya estan registrados ese mes."""
-    fecha_ref = fecha_ref or datetime.now()
+    fecha_ref = fecha_ref or ahora()
     mes_actual = fecha_ref.strftime("%Y-%m")
     fecha_hoy = fecha_ref.strftime("%Y-%m-%d")
 
@@ -318,3 +361,4 @@ def total_ahorrado_fondo(nombre):
     ahorrado = sum(t["monto"] for t in todas if t["tipo"] == "ahorro" and t["categoria"] == nombre)
     retirado = sum(t["monto"] for t in todas if t["tipo"] == "retiro_ahorro" and t["categoria"] == nombre)
     return ahorrado - retirado
+

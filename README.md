@@ -1,10 +1,8 @@
-# Bot de Finanzas Personales (AWS Lambda + DynamoDB + Telegram)
+# Bot de Finanzas Personales 
 
-Misma lógica de negocio que las versiones anteriores (Render/Telegram con
-polling), pero con arquitectura **serverless**: en vez de un proceso corriendo
+Con arquitectura **serverless**: en vez de un proceso corriendo
 24/7 esperando mensajes, aquí el código **solo se ejecuta cuando hay algo que
-hacer** (llega un mensaje, o toca un resumen programado). Esto encaja con
-los niveles "Always Free" de AWS, que **no caducan**.
+hacer** (llega un mensaje, o toca un resumen programado).
 
 ## Qué cambió respecto a la versión de Telegram con polling?
 
@@ -195,7 +193,11 @@ nivel de lo que le puedes escribir:
 | `definir gasto fijo arriendo 800000` | Definir gasto fijo (no se registra solo) |
 | `registrar gastos fijos` | Registrar los gastos fijos pendientes del mes |
 | `balance por medio de pago` | Ver gastos agrupados por efectivo/tarjeta/etc |
-| `listar` / `borrar 5` / `editar 5 monto 30000` | Ver, borrar o editar transacciones |
+| `listar` / `borrar 5` / `borrar ultimo` | Ver o borrar transacciones |
+| `editar 5 medio efectivo` | Edita cualquier campo: `monto`, `categoria`, `fecha`, `descripcion`, `tipo`, `medio` |
+| `editar 5 monto 30.000 categoria comida` | Varios campos a la vez (la `descripcion` va al final) |
+| `editar ultimo monto 30000` | Edita la transaccion mas reciente |
+| `cambiale a la del brownie que fue en efectivo` | Tambien en lenguaje natural: la IA decide si editas o registras |
 
 ## 9. Costo esperado
 

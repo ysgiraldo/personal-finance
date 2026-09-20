@@ -1,7 +1,7 @@
 import calendar
-from datetime import datetime
 
 from . import db
+from .utils import ahora
 
 
 def formato_pesos(numero):
@@ -9,12 +9,12 @@ def formato_pesos(numero):
 
 
 def dias_en_el_mes(fecha=None):
-    fecha = fecha or datetime.now()
+    fecha = fecha or ahora()
     return calendar.monthrange(fecha.year, fecha.month)[1]
 
 
 def dias_restantes_del_mes(fecha=None):
-    fecha = fecha or datetime.now()
+    fecha = fecha or ahora()
     return dias_en_el_mes(fecha) - fecha.day + 1
 
 
@@ -56,7 +56,7 @@ def proyeccion_categoria(categoria):
     if not progreso:
         return None
 
-    hoy = datetime.now()
+    hoy = ahora()
     promedio_diario = progreso["total_gastado"] / hoy.day
     proyeccion_cierre = promedio_diario * dias_en_el_mes(hoy)
 
@@ -192,7 +192,7 @@ def progreso_general():
     total_gastado = sum(t["monto"] for t in db.transacciones_del_mes(None, "gasto"))
     porcentaje = (total_gastado / meta["limite_mensual"]) * 100
 
-    hoy = datetime.now()
+    hoy = ahora()
     promedio_diario = total_gastado / hoy.day
     proyeccion_cierre = promedio_diario * dias_en_el_mes(hoy)
 
