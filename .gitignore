@@ -15,3 +15,4 @@ dynamodb-policy.json
 package/
 package.zip
 respuesta.json
+deploy_update.sh

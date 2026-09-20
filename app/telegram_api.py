@@ -24,8 +24,7 @@ def enviar_mensaje(chat_id, texto):
 
 
 def configurar_webhook(url_publica):
-    """Le dice a Telegram hacia donde debe mandar los mensajes entrantes.
-    Se corre UNA SOLA VEZ (o cada vez que cambie la URL del API Gateway)."""
+    """Le dice a Telegram hacia donde debe mandar los mensajes entrantes."""
     url = f"{_BASE_URL}/setWebhook"
     payload = json.dumps({"url": url_publica}).encode("utf-8")
     peticion = urllib.request.Request(
@@ -33,3 +32,4 @@ def configurar_webhook(url_publica):
     )
     with urllib.request.urlopen(peticion, timeout=10) as respuesta:
         return json.loads(respuesta.read())
+    

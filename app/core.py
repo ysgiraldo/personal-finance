@@ -1,13 +1,130 @@
 import re
-from datetime import datetime
 
+from . import campos
 from . import db
 from . import goals
 from .llm import interpretar_mensaje
+from .utils import hoy_iso, sin_tildes
+
+# --- Edicion de transacciones ---
+# "editar <id|ultimo> <campo> <valor> [<campo> <valor> ...]"
+# Ej: editar 24 medio efectivo | editar 24 monto 30.000 categoria comida
+_RE_EDITAR = re.compile(
+    r"^(?:editar|modificar|cambiar|corregir|actualizar)\s+#?(\d+|[uú]ltim[oa])\b\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_CAMPO = re.compile(
+    r"\b(monto|valor|precio|categoria|categoría|fecha|descripcion|descripción|detalle|tipo|medio_pago|medio)\b",
+    re.IGNORECASE,
+)
+_ALIAS_CAMPOS = {
+    "monto": "monto", "valor": "monto", "precio": "monto",
+    "categoria": "categoria", "fecha": "fecha",
+    "descripcion": "descripcion", "detalle": "descripcion",
+    "tipo": "tipo", "medio": "medio_pago", "medio_pago": "medio_pago",
+}
+_ETIQUETAS_CAMPOS = {
+    "monto": "monto", "categoria": "categoria", "fecha": "fecha",
+    "descripcion": "descripcion", "tipo": "tipo", "medio_pago": "medio de pago",
+}
+
+AYUDA_EDITAR = (
+    "Para editar escribe: editar <id> <campo> <valor>\n"
+    "Campos: monto, categoria, fecha, descripcion, tipo, medio\n"
+    "Ejemplos:\n"
+    "  editar 24 medio efectivo\n"
+    "  editar 24 monto 30000 categoria comida\n"
+    "  editar ultimo fecha ayer\n"
+    "(la descripcion va al final). Usa 'listar' para ver los ids."
+)
 
 
-def hoy_iso():
-    return datetime.now().strftime("%Y-%m-%d")
+def _parsear_cambios(resto):
+    """'monto 30.000 categoria comida' -> ({'monto': 30000.0, 'categoria': 'comida'}, [])
+    Devuelve (cambios, errores). No toca la base de datos."""
+    marcas = list(_RE_CAMPO.finditer(resto))
+    if not marcas or resto[:marcas[0].start()].strip():
+        return {}, ["No entendi que campo quieres cambiar."]
+
+    cambios, errores = {}, []
+    for i, marca in enumerate(marcas):
+        campo = _ALIAS_CAMPOS[sin_tildes(marca.group(1).lower())]
+        # La descripcion es texto libre: se lleva TODO lo que sigue (puede contener
+        # palabras como "tipo" sin que las confundamos con un campo).
+        fin = len(resto) if campo == "descripcion" or i + 1 == len(marcas) else marcas[i + 1].start()
+        valor = resto[marca.end():fin].strip()
+
+        if not valor:
+            errores.append(f"Falta el valor de {_ETIQUETAS_CAMPOS[campo]}.")
+        elif campo == "monto":
+            monto = campos.parse_monto(valor)
+            if monto is None:
+                errores.append(f"'{valor}' no es un monto valido.")
+            else:
+                cambios["monto"] = monto
+        elif campo == "fecha":
+            fecha = campos.parse_fecha(valor)
+            if fecha is None:
+                errores.append(f"'{valor}' no es una fecha valida (usa AAAA-MM-DD, DD/MM, hoy o ayer).")
+            else:
+                cambios["fecha"] = fecha
+        elif campo == "tipo":
+            tipo = campos.parse_tipo(valor)
+            if tipo is None:
+                errores.append(f"'{valor}' no es un tipo valido (gasto, ingreso, ahorro, retiro_ahorro).")
+            else:
+                cambios["tipo"] = tipo
+        elif campo == "medio_pago":
+            valido, medio = campos.parse_medio(valor)
+            if not valido:
+                errores.append(f"'{valor}' no es un medio de pago valido "
+                               "(efectivo, credito, debito, transferencia o ninguno).")
+            else:
+                cambios["medio_pago"] = medio  # None = quitar el medio de pago
+        elif campo == "categoria":
+            cambios["categoria"] = campos.normalizar_categoria(valor)
+        else:  # descripcion
+            cambios["descripcion"] = valor[:120]
+
+        if campo == "descripcion":
+            break
+
+    return cambios, errores
+
+
+def _valor_legible(campo, valor):
+    if valor is None or valor == "":
+        return "Sin especificar" if campo == "medio_pago" else "(vacio)"
+    if campo == "monto":
+        return goals.formato_pesos(valor)
+    if campo == "medio_pago":
+        return goals.NOMBRES_MEDIO_PAGO.get(valor, valor)
+    return str(valor)
+
+
+def _aplicar_edicion(id_transaccion, cambios):
+    """Modifica una transaccion EXISTENTE (nunca crea una nueva) y explica que cambio."""
+    resultado = db.actualizar_transaccion(id_transaccion, cambios)
+    if resultado is None:
+        return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
+
+    antes, despues = resultado
+    lineas = []
+    for campo in cambios:
+        if antes.get(campo) != despues.get(campo):
+            lineas.append(
+                f"- {_ETIQUETAS_CAMPOS[campo]}: {_valor_legible(campo, antes.get(campo))}"
+                f" -> {_valor_legible(campo, despues.get(campo))}"
+            )
+    if not lineas:
+        return f"La transaccion #{id_transaccion} ya tenia esos valores, no cambie nada."
+
+    respuesta = f"Transaccion #{id_transaccion} actualizada:\n" + "\n".join(lineas)
+    if despues["tipo"] == "gasto":
+        for progreso in (goals.mensaje_progreso_categoria(despues["categoria"]), goals.mensaje_progreso_general()):
+            if progreso:
+                respuesta += f"\n{progreso}"
+    return respuesta
 
 
 def procesar_mensaje(texto):
@@ -137,38 +254,62 @@ def procesar_mensaje(texto):
             return f"Transaccion #{id_transaccion} eliminada."
         return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
 
-    # --- Editar una transaccion (monto o categoria) ---
-    match_editar_monto = re.match(r"^editar (\d+) monto (\d+)$", texto_limpio)
-    if match_editar_monto:
-        id_transaccion, nuevo_monto = match_editar_monto.groups()
-        id_transaccion = int(id_transaccion)
-        if db.editar_monto_transaccion(id_transaccion, float(nuevo_monto)):
-            return f"Transaccion #{id_transaccion} actualizada a {goals.formato_pesos(float(nuevo_monto))}."
-        return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
+    # --- Editar una transaccion: cualquier campo, uno o varios a la vez ---
+    # Todo mensaje que empiece con "editar <id>" se resuelve AQUI. Si algo esta mal
+    # escrito se responde con ayuda, pero JAMAS se le pasa a la IA (que lo
+    # registraria como una transaccion nueva y duplicada).
+    match_editar = _RE_EDITAR.match(texto_original)
+    if match_editar:
+        referencia, resto = match_editar.groups()
+        if referencia.isdigit():
+            id_transaccion = int(referencia)
+        else:  # "ultimo" / "ultima"
+            recientes = db.ultimas_transacciones(1)
+            if not recientes:
+                return "No tienes transacciones para editar."
+            id_transaccion = recientes[0]["id"]
 
-    match_editar_categoria = re.match(r"^editar (\d+) categoria (\w+)$", texto_limpio)
-    if match_editar_categoria:
-        id_transaccion, nueva_categoria = match_editar_categoria.groups()
-        id_transaccion = int(id_transaccion)
-        if db.editar_categoria_transaccion(id_transaccion, nueva_categoria):
-            return f"Transaccion #{id_transaccion} actualizada a categoria '{nueva_categoria}'."
-        return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
+        cambios, errores = _parsear_cambios(resto)
+        if errores:
+            return "\n".join(errores) + "\n\n" + AYUDA_EDITAR
+        return _aplicar_edicion(id_transaccion, cambios)
 
-    match_editar_fecha = re.match(r"^editar (\d+) fecha (\d{4}-\d{2}-\d{2})$", texto_limpio)
-    if match_editar_fecha:
-        id_transaccion, nueva_fecha = match_editar_fecha.groups()
-        id_transaccion = int(id_transaccion)
-        if db.editar_fecha_transaccion(id_transaccion, nueva_fecha):
-            return f"Transaccion #{id_transaccion} actualizada a la fecha {nueva_fecha}."
-        return f"No encontre ninguna transaccion con id #{id_transaccion}. Escribe 'listar' para ver los ids."
+    if re.match(r"^(?:editar|modificar|cambiar|corregir|actualizar)\s*$", texto_limpio):
+        return AYUDA_EDITAR
 
-    # Si no es un comando conocido, lo interpretamos como un movimiento financiero
-    datos = interpretar_mensaje(texto_original)
+    # Si no es un comando conocido, la IA decide que quiere la persona
+    # (registrar un movimiento nuevo, editar uno existente, borrar, o preguntar).
+    datos = interpretar_mensaje(texto_original, recientes=db.ultimas_transacciones(10))
+    accion = datos["accion"]
 
-    if datos is None:
+    if accion == "editar":
+        if datos["id"] is None:
+            return (
+                "No estoy seguro de cual transaccion quieres editar. "
+                "Escribe 'listar' para ver los ids y luego 'editar <id> <campo> <valor>'.\n\n" + AYUDA_EDITAR
+            )
+        return _aplicar_edicion(datos["id"], datos["cambios"])
+
+    if accion == "borrar":
+        # Borrar es irreversible: la IA solo propone, la persona confirma con 'borrar <id>'.
+        objetivo = db.obtener_transaccion(datos["id"]) if datos["id"] is not None else None
+        if not objetivo:
+            return "No estoy seguro de cual transaccion quieres borrar. Escribe 'listar' y luego 'borrar <id>'."
+        return (
+            f"Quieres borrar #{objetivo['id']} ({goals.formato_pesos(objetivo['monto'])} en "
+            f"{objetivo['categoria']}, {objetivo['fecha']})? Escribe 'borrar {objetivo['id']}' para confirmar."
+        )
+
+    if accion == "consulta":
+        return (
+            "Por ahora no respondo preguntas abiertas. Prueba: 'resumen semanal', "
+            "'resumen mensual', 'listar' o 'balance por medio de pago'."
+        )
+
+    if accion != "registrar":
         return 'No entendi ese mensaje como un movimiento financiero. Prueba algo como "gaste 25000 en almuerzo".'
 
-    db.agregar_transaccion(
+    nuevo_id = db.agregar_transaccion(
         fecha=datos["fecha"],
         tipo=datos["tipo"],
         monto=datos["monto"],
@@ -181,9 +322,9 @@ def procesar_mensaje(texto):
     sufijo_fecha = "" if fecha_es_hoy else f" (el {datos['fecha']})"
 
     if datos["tipo"] == "retiro_ahorro":
-        respuesta = f"Registrado: retiro de {goals.formato_pesos(datos['monto'])} del fondo '{datos['categoria']}'{sufijo_fecha}."
+        respuesta = f"Registrado #{nuevo_id}: retiro de {goals.formato_pesos(datos['monto'])} del fondo '{datos['categoria']}'{sufijo_fecha}."
     else:
-        respuesta = f"Registrado: {goals.formato_pesos(datos['monto'])} ({datos['tipo']}) en {datos['categoria']}{sufijo_fecha}."
+        respuesta = f"Registrado #{nuevo_id}: {goals.formato_pesos(datos['monto'])} ({datos['tipo']}) en {datos['categoria']}{sufijo_fecha}."
         if datos.get("medio_pago"):
             respuesta += f" — {goals.NOMBRES_MEDIO_PAGO.get(datos['medio_pago'], datos['medio_pago'])}"
 
