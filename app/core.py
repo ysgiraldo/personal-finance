@@ -1,10 +1,11 @@
 import re
+from datetime import timedelta
 
 from . import campos
 from . import db
 from . import goals
 from .llm import interpretar_mensaje
-from .utils import hoy_iso, sin_tildes
+from .utils import ahora, hoy_iso, sin_tildes
 
 # --- Edicion de transacciones ---
 # "editar <id|ultimo> <campo> <valor> [<campo> <valor> ...]"
@@ -135,6 +136,13 @@ def procesar_mensaje(texto):
     texto_limpio = texto_original.lower()
 
     # --- Comandos de consulta general ---
+    if texto_limpio in ("hoy", "gastos de hoy", "cuanto he gastado hoy", "cuánto he gastado hoy",
+                        "cuanto llevo gastado hoy", "resumen del dia", "resumen del día"):
+        return goals.resumen_dia()
+
+    if texto_limpio in ("ayer", "gastos de ayer"):
+        return goals.resumen_dia((ahora() - timedelta(days=1)).strftime("%Y-%m-%d"))
+
     if texto_limpio in ("resumen semanal", "como voy", "cómo voy"):
         return goals.resumen_semanal()
 
@@ -301,10 +309,15 @@ def procesar_mensaje(texto):
         )
 
     if accion == "consulta":
-        return (
-            "Por ahora no respondo preguntas abiertas. Prueba: 'resumen semanal', "
-            "'resumen mensual', 'listar' o 'balance por medio de pago'."
-        )
+        from . import asistente
+        try:
+            return asistente.responder(texto_original)
+        except Exception as err:
+            print(f"Error del asistente: {err}")
+            return (
+                "No pude pensar bien la respuesta en este momento. Prueba de nuevo, o usa "
+                "'hoy', 'resumen semanal', 'resumen mensual' o 'listar'."
+            )
 
     if accion != "registrar":
         return 'No entendi ese mensaje como un movimiento financiero. Prueba algo como "gaste 25000 en almuerzo".'
@@ -329,13 +342,17 @@ def procesar_mensaje(texto):
             respuesta += f" — {goals.NOMBRES_MEDIO_PAGO.get(datos['medio_pago'], datos['medio_pago'])}"
 
     if datos["tipo"] == "gasto":
-        progreso_texto = goals.mensaje_progreso_categoria(datos["categoria"])
-        if progreso_texto:
-            respuesta += f"\n{progreso_texto}"
-
-        progreso_general_texto = goals.mensaje_progreso_general()
-        if progreso_general_texto:
-            respuesta += f"\n{progreso_general_texto}"
+        # Alertas inteligentes: solo avisan cuando ESTE gasto cruza un umbral
+        # (80%/100% de un presupuesto, o un dia con gasto muy por encima de lo normal).
+        # No se repiten en cada gasto, solo cuando algo realmente cambia.
+        from . import analisis
+        try:
+            transaccion = db.obtener_transaccion(nuevo_id)
+            alertas = analisis.alertas_por_gasto(analisis.cargar_contexto(), transaccion)
+            if alertas:
+                respuesta += "\n\n" + "\n".join(alertas)
+        except Exception as err:
+            print(f"No se pudieron calcular las alertas: {err}")
 
         # Si el mensaje dejaba explicito que es un gasto fijo (ej. "pago fijo
         # cada mes"), lo guardamos como definicion de gasto fijo para el futuro.
