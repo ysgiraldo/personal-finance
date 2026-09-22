@@ -1,11 +1,9 @@
 import calendar
+from datetime import datetime, timedelta
 
+from . import analisis
 from . import db
-from .utils import ahora
-
-
-def formato_pesos(numero):
-    return "$" + f"{round(numero):,}".replace(",", ".")
+from .utils import ahora, formato_pesos, DIAS_SEMANA
 
 
 def dias_en_el_mes(fecha=None):
@@ -22,7 +20,7 @@ def progreso_categoria(categoria):
     """Devuelve el progreso de gasto de una categoria con presupuesto definido,
     o None si esa categoria no tiene presupuesto configurado."""
     meta = db.obtener_meta(categoria)
-    if not meta or meta["tipo"] != "presupuesto":
+    if not meta or meta["tipo"] != "presupuesto" or not meta["limite_mensual"]:
         return None
 
     transacciones = db.transacciones_del_mes(categoria, "gasto")
@@ -50,15 +48,15 @@ def mensaje_progreso_categoria(categoria):
     )
 
 
-def proyeccion_categoria(categoria):
-    """Proyecta el cierre de mes para una categoria segun el ritmo actual de gasto."""
+def proyeccion_categoria(categoria, ctx=None):
+    """Proyecta el cierre de mes para una categoria segun el ritmo actual de gasto
+    (lo fijo se cuenta una sola vez; solo lo variable sigue el ritmo diario)."""
     progreso = progreso_categoria(categoria)
     if not progreso:
         return None
 
-    hoy = ahora()
-    promedio_diario = progreso["total_gastado"] / hoy.day
-    proyeccion_cierre = promedio_diario * dias_en_el_mes(hoy)
+    ctx = ctx or analisis.cargar_contexto()
+    proyeccion_cierre = analisis.proyeccion_cierre_mes(ctx, categoria)
 
     return {
         **progreso,
@@ -169,9 +167,12 @@ def resumen_mensual_con_proyeccion():
     if not metas:
         return 'Aun no has definido presupuestos por categoria. Escribe "definir presupuesto <categoria> <monto>" para empezar.'
 
+    ctx = analisis.cargar_contexto()
     lineas = []
     for m in metas:
-        proyeccion = proyeccion_categoria(m["categoria"])
+        proyeccion = proyeccion_categoria(m["categoria"], ctx)
+        if not proyeccion:  # presupuesto en 0: no hay nada que proyectar
+            continue
         alerta = "⚠️ te vas a pasar" if proyeccion["se_superaria"] else "✅ vas bien"
         lineas.append(
             f"{m['categoria']}: {formato_pesos(proyeccion['total_gastado'])}/"
@@ -184,17 +185,16 @@ def resumen_mensual_con_proyeccion():
 
 # --- Presupuesto general (tope total del mes, sin importar la categoria) ---
 
-def progreso_general():
+def progreso_general(ctx=None):
     meta = db.obtener_presupuesto_general()
-    if not meta:
+    if not meta or not meta["limite_mensual"]:
         return None
 
     total_gastado = sum(t["monto"] for t in db.transacciones_del_mes(None, "gasto"))
     porcentaje = (total_gastado / meta["limite_mensual"]) * 100
 
-    hoy = ahora()
-    promedio_diario = total_gastado / hoy.day
-    proyeccion_cierre = promedio_diario * dias_en_el_mes(hoy)
+    ctx = ctx or analisis.cargar_contexto()
+    proyeccion_cierre = analisis.proyeccion_cierre_mes(ctx)
 
     return {
         "total_gastado": total_gastado,
@@ -319,3 +319,94 @@ def mensaje_registro_gastos_fijos(gastos_fijos_registrados):
         + "\n".join(lineas)
         + f"\nTotal: {formato_pesos(total)}"
     )
+
+
+# --- Resumen del dia ---
+
+def _etiqueta_dia(fecha_iso, ctx):
+    fecha = datetime.strptime(fecha_iso, "%Y-%m-%d")
+    nombre = DIAS_SEMANA[fecha.weekday()]
+    ayer = (ctx["hoy"] - timedelta(days=1)).strftime("%Y-%m-%d")
+    if fecha_iso == ctx["hoy_iso"]:
+        return f"Hoy ({nombre} {fecha_iso})"
+    if fecha_iso == ayer:
+        return f"Ayer ({nombre} {fecha_iso})"
+    return f"{nombre} {fecha_iso}"
+
+
+def resumen_dia(fecha_iso=None, ctx=None):
+    """Cuanto se gasto en un dia (por defecto hoy), con contexto: comparacion
+    contra tu promedio diario y cuanto puedes gastar por dia el resto del mes."""
+    ctx = ctx or analisis.cargar_contexto()
+    fecha_iso = fecha_iso or ctx["hoy_iso"]
+    es_hoy = fecha_iso == ctx["hoy_iso"]
+
+    del_dia = [t for t in ctx["todas"] if t["fecha"] == fecha_iso]
+    encabezado = f"📅 {_etiqueta_dia(fecha_iso, ctx)}"
+    if not del_dia:
+        return encabezado + "\n" + ("Hoy no has registrado movimientos." if es_hoy
+                                     else "No hay movimientos registrados ese dia.")
+
+    gastos = [t for t in del_dia if t["tipo"] == "gasto"]
+    total_gastos = sum(t["monto"] for t in gastos)
+
+    lineas = [encabezado]
+    if gastos:
+        lineas.append(f"Gastos: {formato_pesos(total_gastos)} ({len(gastos)} movimiento(s))")
+        for t in gastos[:15]:
+            detalle = f" — {t['descripcion']}" if t.get("descripcion") else ""
+            lineas.append(f"  #{t['id']} {t['categoria']} {formato_pesos(t['monto'])}{detalle}")
+        if len(gastos) > 15:
+            lineas.append(f"  ...y {len(gastos) - 15} mas")
+
+        por_categoria = {}
+        for t in gastos:
+            por_categoria[t["categoria"]] = por_categoria.get(t["categoria"], 0) + t["monto"]
+        if len(por_categoria) > 1:
+            top = sorted(por_categoria.items(), key=lambda kv: kv[1], reverse=True)
+            lineas.append("Por categoria: " + ", ".join(f"{c} {formato_pesos(m)}" for c, m in top))
+    else:
+        lineas.append("Gastos: $0")
+
+    for tipo, etiqueta in (("ingreso", "Ingresos"), ("ahorro", "Ahorro"), ("retiro_ahorro", "Retiros de ahorro")):
+        suma = analisis.total(del_dia, tipo)
+        if suma > 0:
+            lineas.append(f"{etiqueta}: {formato_pesos(suma)}")
+
+    if es_hoy:
+        lineas.append("")
+        base = analisis.promedio_diario_variable(ctx)
+        if gastos and base:
+            variable_hoy = analisis.gasto_variable_del_dia(ctx, fecha_iso)
+            lineas.append(
+                f"Tu promedio diario (ultimos 30 dias, sin gastos fijos) es {formato_pesos(base)}; "
+                f"hoy vas en {formato_pesos(variable_hoy)} ({variable_hoy / base * 100:.0f}%)."
+            )
+
+        gasto_mes = analisis.total(ctx["del_mes"], "gasto")
+        lineas.append(f"En lo que va del mes: {formato_pesos(gasto_mes)} en gastos.")
+
+        disponible = analisis.disponible_mes(ctx)
+        if disponible:
+            if disponible["libre"] >= 0:
+                texto = (
+                    f"Presupuesto general: te quedan {formato_pesos(disponible['libre'])} para "
+                    f"{disponible['dias_restantes']} dias (~{formato_pesos(disponible['por_dia'])} por dia)"
+                )
+                if disponible["fijos_pendientes"] > 0:
+                    texto += f", ya descontando {formato_pesos(disponible['fijos_pendientes'])} de gastos fijos por registrar"
+                lineas.append(texto + ".")
+            else:
+                lineas.append(f"Ya superaste tu presupuesto general por {formato_pesos(-disponible['libre'])}.")
+
+    return "\n".join(lineas)
+
+
+def resumen_diario_noche():
+    """Version para el aviso programado de la noche. Si no registraste nada,
+    te lo recuerda (un bot de registro manual vale tanto como tu constancia)."""
+    ctx = analisis.cargar_contexto()
+    texto = resumen_dia(ctx=ctx)
+    if not any(t["fecha"] == ctx["hoy_iso"] for t in ctx["todas"]):
+        texto += '\n¿Se te quedo algo por contar? Escribeme, por ejemplo: "gaste 15000 en almuerzo".'
+    return texto

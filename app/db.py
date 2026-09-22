@@ -1,4 +1,6 @@
 import os
+import json
+import time
 import boto3
 from decimal import Decimal
 from datetime import timedelta
@@ -362,3 +364,50 @@ def total_ahorrado_fondo(nombre):
     retirado = sum(t["monto"] for t in todas if t["tipo"] == "retiro_ahorro" and t["categoria"] == nombre)
     return ahorrado - retirado
 
+
+
+# --- Deduplicacion de mensajes de Telegram ---
+
+def registrar_update_procesado(update_id):
+    """Devuelve True la primera vez que se ve un update_id y False si ya se
+    habia procesado.
+
+    Telegram REINTENTA el webhook si no recibe un 200 a tiempo (por ejemplo si
+    Lambda se demora por un cold start o una llamada lenta a la IA). Sin esto,
+    cada reintento registraria la misma transaccion otra vez.
+    El atributo `ttl` permite que DynamoDB borre estos registros solo (ver README).
+    """
+    try:
+        _tabla.put_item(
+            Item={"PK": "UPDATE", "SK": str(update_id), "ttl": int(time.time()) + 86400},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as err:
+        if err.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+# --- Memoria corta de la conversacion con el asistente ---
+
+_VIGENCIA_CONVERSACION_SEG = 30 * 60  # pasado este tiempo sin hablar, se olvida el hilo
+_MAX_MENSAJES_CONVERSACION = 6        # 3 idas y vueltas
+
+
+def obtener_conversacion():
+    """Ultimos mensajes [{'role','content'}, ...] del hilo con el asistente,
+    o [] si no hay o ya expiro."""
+    item = _tabla.get_item(Key={"PK": "CONVERSACION", "SK": "ASISTENTE"}).get("Item")
+    if not item or time.time() - float(item.get("actualizado", 0)) > _VIGENCIA_CONVERSACION_SEG:
+        return []
+    return json.loads(item.get("mensajes", "[]"))
+
+
+def guardar_conversacion(mensajes):
+    mensajes = mensajes[-_MAX_MENSAJES_CONVERSACION:]
+    _tabla.put_item(Item={
+        "PK": "CONVERSACION", "SK": "ASISTENTE",
+        "mensajes": json.dumps(mensajes, ensure_ascii=False),
+        "actualizado": int(time.time()),
+    })
